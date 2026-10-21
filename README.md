@@ -2,6 +2,31 @@
 
 A HAL virtual audio driver for macOS that sends all output to another audio device. Its main purpose is to make it possible to use macOS's system volume controls, such as the volume menu bar icon or volume keyboard keys, to change the volume of external audio interfaces that don't allow it. It might be useful for something else, too.
 
+### Enhancements in this fork
+
+This fork adds two enhancements on top of the upstream driver:
+
+1. **Automatic proxy device removal.** When the proxied output device disappears
+   (e.g. a USB / USB-C display audio device is unplugged), the proxy device is
+   removed from the audio device list after a 10-second grace period, so the
+   system automatically falls back to another output such as the built-in
+   speakers. The removal is debounced and re-checked against the device list
+   right before it executes, so brief link retrains (a USB-C display retraining
+   its link right after wake) do not flap the device list. When the proxied
+   device comes back, the proxy device reappears. Note that macOS does not
+   automatically switch the default output back to the proxy device; re-select
+   it once if you want it. This feature is controlled by the code-level switch
+   `kRemoveProxyWhenTargetUnavailableDefault` in `ProxyAudioDevice.h` (on by
+   default; the grace period is `kTargetRemovalGracePeriodSeconds`).
+
+2. **Adjustable perceptual volume curve.** The scalar volume (0–1) is converted
+   to dB as `dB = min + (max − min) · scalar^γ`. γ = 1 is the upstream
+   linear-in-dB behavior; γ < 1 spends more of the slider's travel in the loud
+   region for finer control there. The exponent γ is adjustable from the
+   settings app with a live preview of the response curve (the dashed line is
+   the original γ = 1 curve).
+
+
 ### Installation
 
 #### Install with a package manager

@@ -571,6 +571,7 @@ OSStatus ProxyAudioDevice::Initialize(AudioServerPlugInDriverRef inDriver, Audio
     outputDeviceBufferFrameSize = retrieveOutputDeviceBufferFrameSizeFromStorage();
     outputDeviceActiveCondition = retrieveOutputDeviceActiveConditionFromStorage();
     outputDeviceHideWhenUnavailable = retrieveOutputDeviceHideWhenUnavailableFromStorage();
+    volumeCurveGamma = retrieveVolumeCurveGammaFromStorage();
 
     //    calculate the host ticks per frame
     struct mach_timebase_info theTimeBaseInfo;
@@ -1329,7 +1330,7 @@ OSStatus ProxyAudioDevice::GetPlugInPropertyDataSize(AudioServerPlugInDriverRef 
             break;
 
         case kAudioPlugInPropertyDeviceList:
-            if (gBox_Acquired) {
+            if (proxyDeviceIsVisible()) {
                 *outDataSize = sizeof(AudioClassID);
             } else {
                 *outDataSize = 0;
@@ -1516,10 +1517,11 @@ OSStatus ProxyAudioDevice::GetPlugInPropertyData(AudioServerPlugInDriverRef inDr
             //    case, only that number of items will be returned
             theNumberItemsToFetch = inDataSize / sizeof(AudioObjectID);
 
-            //    Clamp that to the number of devices this driver implements (which is just 1 if the
-            //    box has been acquired)
-            if (theNumberItemsToFetch > (gBox_Acquired ? 1 : 0)) {
-                theNumberItemsToFetch = (gBox_Acquired ? 1 : 0);
+            //    Clamp that to the number of devices this driver implements (which is just 1 if
+            //    the box has been acquired and the proxy device has not been auto-removed
+            //    because its target output device is unavailable)
+            if (theNumberItemsToFetch > (proxyDeviceIsVisible() ? 1 : 0)) {
+                theNumberItemsToFetch = (proxyDeviceIsVisible() ? 1 : 0);
             }
 
             //    Write the devices' object IDs into the return value
@@ -1552,7 +1554,8 @@ OSStatus ProxyAudioDevice::GetPlugInPropertyData(AudioServerPlugInDriverRef inDr
                            Done,
                            "GetPlugInPropertyData: no qualifier for kAudioPlugInPropertyTranslateUIDToDevice");
             
-            if (CFStringCompare(*((CFStringRef *)inQualifierData), CFSTR(kDevice_UID), 0) == kCFCompareEqualTo) {
+            if (CFStringCompare(*((CFStringRef *)inQualifierData), CFSTR(kDevice_UID), 0) == kCFCompareEqualTo
+                && proxyDeviceIsVisible()) {
                 *((AudioObjectID *)outData) = kObjectID_Device;
             } else {
                 *((AudioObjectID *)outData) = kAudioObjectUnknown;
@@ -4243,10 +4246,9 @@ OSStatus ProxyAudioDevice::GetControlPropertyData(AudioServerPlugInDriverRef inD
                         }
                     }
 
-                    //    Note that we square the scalar value before converting to dB so as to
-                    //    provide a better curve for the slider
-                    *((Float32 *)outData) *= *((Float32 *)outData);
-                    *((Float32 *)outData) = kVolume_MinDB + (*((Float32 *)outData) * (kVolume_MaxDB - kVolume_MinDB));
+                    //    Convert to dB with the perceptual volume curve so that what clients
+                    //    see here matches the gain the device actually applies.
+                    *((Float32 *)outData) = volumeScalarToDecibels(*((Float32 *)outData));
 
                     //    report how much we wrote
                     *outDataSize = sizeof(Float32);
@@ -4280,10 +4282,9 @@ OSStatus ProxyAudioDevice::GetControlPropertyData(AudioServerPlugInDriverRef inD
                         *((Float32 *)outData) = 1.0;
                     }
 
-                    //    Note that we square the scalar value before converting to dB so as to
-                    //    provide a better curve for the slider
-                    *((Float32 *)outData) *= *((Float32 *)outData);
-                    *((Float32 *)outData) = kVolume_MinDB + (*((Float32 *)outData) * (kVolume_MaxDB - kVolume_MinDB));
+                    //    Convert with the perceptual volume curve so this matches both the
+                    //    dB values the device reports and the gain it applies.
+                    *((Float32 *)outData) = volumeScalarToDecibels(*((Float32 *)outData));
 
                     //    report how much we wrote
                     *outDataSize = sizeof(Float32);
@@ -4297,19 +4298,9 @@ OSStatus ProxyAudioDevice::GetControlPropertyData(AudioServerPlugInDriverRef inD
                                    "GetControlPropertyData: not enough space for the return value of "
                                    "kAudioLevelControlPropertyDecibelValue for the volume control");
 
-                    //    clamp the value to be between kVolume_MinDB and kVolume_MaxDB
-                    if (*((Float32 *)outData) < kVolume_MinDB) {
-                        *((Float32 *)outData) = kVolume_MinDB;
-                    }
-                    if (*((Float32 *)outData) > kVolume_MaxDB) {
-                        *((Float32 *)outData) = kVolume_MaxDB;
-                    }
-
-                    //    Note that we square the scalar value before converting to dB so as to
-                    //    provide a better curve for the slider. We undo that here.
-                    *((Float32 *)outData) = *((Float32 *)outData) - kVolume_MinDB;
-                    *((Float32 *)outData) /= kVolume_MaxDB - kVolume_MinDB;
-                    *((Float32 *)outData) = sqrtf(*((Float32 *)outData));
+                    //    Convert with the perceptual volume curve (inverse of
+                    //    volumeScalarToDecibels).
+                    *((Float32 *)outData) = volumeDecibelsToScalar(*((Float32 *)outData));
 
                     //    report how much we wrote
                     *outDataSize = sizeof(Float32);
@@ -4576,16 +4567,9 @@ OSStatus ProxyAudioDevice::SetControlPropertyData(AudioServerPlugInDriverRef inD
                         Done,
                         "SetControlPropertyData: wrong size for the data for kAudioLevelControlPropertyScalarValue");
                     theNewVolume = *((const Float32 *)inData);
-                    if (theNewVolume < kVolume_MinDB) {
-                        theNewVolume = kVolume_MinDB;
-                    } else if (theNewVolume > kVolume_MaxDB) {
-                        theNewVolume = kVolume_MaxDB;
-                    }
-                    //    Note that we square the scalar value before converting to dB so as to
-                    //    provide a better curve for the slider. We undo that here.
-                    theNewVolume = theNewVolume - kVolume_MinDB;
-                    theNewVolume /= kVolume_MaxDB - kVolume_MinDB;
-                    theNewVolume = sqrtf(theNewVolume);
+                    //    Convert with the perceptual volume curve (inverse of
+                    //    volumeScalarToDecibels) since the scalar value is what is tracked.
+                    theNewVolume = volumeDecibelsToScalar(theNewVolume);
                     {
                         CAMutex::Locker locker(stateMutex);
                         if (inObjectID == kObjectID_Volume_Output_L) {
@@ -4732,6 +4716,7 @@ int ProxyAudioDevice::outputDeviceAliveListener(AudioObjectID inObjectID,
 
     DebugMsg("ProxyAudio: outputDeviceAliveListener output device no longer alive");
     deinitializeOutputDevice();
+    armProxyRemovalIfNeeded();
 
     return noErr;
 }
@@ -4897,6 +4882,9 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
     if (outputDevice.isValid() && outputDevice.id == newOutputDevice.id
         && outputDevice.bufferFrameSize == outputDeviceBufferFrameSize) {
         DebugMsg("ProxyAudio: setupTargetOutputDevice no change in device");
+        // The target device is present, so any pending auto-removal of the proxy
+        // device can be canceled.
+        cancelProxyRemoval();
         return;
     }
 
@@ -4908,6 +4896,11 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
 
     if (newOutputDevice.isValid()) {
         DebugMsg("ProxyAudio: setupTargetOutputDevice setting up new device");
+        // The target device is available again, so cancel any pending removal
+        // and, if the proxy device was already removed from the system,
+        // restore it before wiring up the new target.
+        cancelProxyRemoval();
+        restoreProxyDeviceFromSystem();
         resetInputData();
         outputDevice = newOutputDevice;
         outputDevice.setBufferFrameSize(outputDeviceBufferFrameSize);
@@ -4926,6 +4919,10 @@ void ProxyAudioDevice::setupTargetOutputDevice() {
         matchOutputDeviceSampleRateNoLock();
     } else {
         syslog(LOG_WARNING, "ProxyAudio: setupTargetOutputDevice could not find output device");
+        // The target device is not in the system device list. If it stays gone
+        // past the grace period, the proxy device will be removed from the
+        // system so that clients fall back to another output.
+        armProxyRemovalIfNeeded();
     }
 }
 
@@ -4968,6 +4965,102 @@ void ProxyAudioDevice::deinitializeOutputDevice()
     DebugMsg("ProxyAudio: deinitializeOutputDevice");
     CAMutex::Locker locker(outputDeviceMutex);
     deinitializeOutputDeviceNoLock();
+}
+
+#pragma mark Proxy Device Auto-Removal
+
+void ProxyAudioDevice::armProxyRemovalIfNeeded()
+{
+    if (!removeProxyWhenTargetUnavailable) {
+        return;
+    }
+
+    {
+        CAMutex::Locker locker(&stateMutex);
+        if (proxyDeviceRemoved || proxyRemovalTimerArmed) {
+            return;
+        }
+        proxyRemovalTimerArmed = true;
+        ++proxyRemovalGeneration;
+    }
+
+    DebugMsg("ProxyAudio: armProxyRemovalIfNeeded, removing proxy device in %.1f seconds if the target stays gone",
+             kTargetRemovalGracePeriodSeconds);
+
+    UInt64 generation = proxyRemovalGeneration;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kTargetRemovalGracePeriodSeconds * NSEC_PER_SEC)),
+                   audioOutputQueue,
+                   ^{
+                       {
+                           CAMutex::Locker locker(&stateMutex);
+                           if (generation != proxyRemovalGeneration || !proxyRemovalTimerArmed || proxyDeviceRemoved) {
+                               return;
+                           }
+                           proxyRemovalTimerArmed = false;
+                       }
+
+                       // Double-check right before removing: the target device may have come
+                       // back during the grace period without us having processed its return
+                       // yet (e.g. a USB-C display retraining its link right after wake).
+                       if (findTargetOutputAudioDevice().isValid()) {
+                           DebugMsg("ProxyAudio: proxy removal timer fired but target device is back, canceling removal");
+                           return;
+                       }
+
+                       removeProxyDeviceFromSystem();
+                   });
+}
+
+void ProxyAudioDevice::cancelProxyRemoval()
+{
+    CAMutex::Locker locker(&stateMutex);
+    if (proxyRemovalTimerArmed) {
+        DebugMsg("ProxyAudio: cancelProxyRemoval");
+        proxyRemovalTimerArmed = false;
+        ++proxyRemovalGeneration;
+    }
+}
+
+void ProxyAudioDevice::removeProxyDeviceFromSystem()
+{
+    {
+        CAMutex::Locker locker(&stateMutex);
+        if (proxyDeviceRemoved) {
+            return;
+        }
+        proxyDeviceRemoved = true;
+    }
+
+    syslog(LOG_NOTICE,
+           "ProxyAudio: removing proxy device from the system because the target output device is unavailable");
+    notifyPluginDeviceListChanged();
+}
+
+void ProxyAudioDevice::restoreProxyDeviceFromSystem()
+{
+    {
+        CAMutex::Locker locker(&stateMutex);
+        if (!proxyDeviceRemoved) {
+            return;
+        }
+        proxyDeviceRemoved = false;
+        proxyRemovalTimerArmed = false;
+        ++proxyRemovalGeneration;
+    }
+
+    syslog(LOG_NOTICE, "ProxyAudio: restoring proxy device, target output device is available again");
+    notifyPluginDeviceListChanged();
+}
+
+void ProxyAudioDevice::notifyPluginDeviceListChanged()
+{
+    ExecuteInAudioOutputThread(^() {
+        AudioObjectPropertyAddress theAddress = {kAudioPlugInPropertyDeviceList,
+                                                 kAudioObjectPropertyScopeGlobal,
+                                                 kAudioObjectPropertyElementMaster};
+        gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_PlugIn, 1, &theAddress);
+    });
 }
 
 void ProxyAudioDevice::setupAudioDevicesListener() {
@@ -5619,6 +5712,75 @@ void ProxyAudioDevice::updateProxyClockCorrectionNoLock() {
 #endif
 }
 
+#pragma mark Volume Curve
+
+Float32 ProxyAudioDevice::volumeScalarToDecibels(Float32 scalar)
+{
+    if (scalar <= 0.0) {
+        return kVolume_MinDB;
+    }
+    if (scalar >= 1.0) {
+        return kVolume_MaxDB;
+    }
+    return kVolume_MinDB + (powf(scalar, volumeCurveGamma) * (kVolume_MaxDB - kVolume_MinDB));
+}
+
+Float32 ProxyAudioDevice::volumeDecibelsToScalar(Float32 decibels)
+{
+    if (decibels <= kVolume_MinDB) {
+        return 0.0;
+    }
+    if (decibels >= kVolume_MaxDB) {
+        return 1.0;
+    }
+    Float32 normalized = (decibels - kVolume_MinDB) / (kVolume_MaxDB - kVolume_MinDB);
+    return powf(normalized, 1.0 / volumeCurveGamma);
+}
+
+Float32 ProxyAudioDevice::retrieveVolumeCurveGammaFromStorage()
+{
+    DebugMsg("ProxyAudio: retrieveVolumeCurveGammaFromStorage");
+
+    if (!gPlugIn_Host) {
+        DebugMsg("ProxyAudio: retrieveVolumeCurveGammaFromStorage no plugin host");
+        return kVolumeCurveGammaDefault;
+    }
+
+    CFPropertyListSmartRef data;
+    gPlugIn_Host->CopyFromStorage(gPlugIn_Host, CFSTR("volumeCurveGamma"), &data);
+
+    if (data == NULL || CFGetTypeID(data) != CFNumberGetTypeID()) {
+        DebugMsg("ProxyAudio: retrieveVolumeCurveGammaFromStorage finished returning default value");
+        return kVolumeCurveGammaDefault;
+    }
+
+    Float32 value = kVolumeCurveGammaDefault;
+    CFNumberGetValue(CFNumberRef(CFPropertyListRef(data)), kCFNumberFloat32Type, &value);
+
+    if (!(value >= kVolumeCurveGammaMin && value <= kVolumeCurveGammaMax)) {
+        DebugMsg("ProxyAudio: retrieveVolumeCurveGammaFromStorage stored value out of range, using default");
+        return kVolumeCurveGammaDefault;
+    }
+
+    return value;
+}
+
+void ProxyAudioDevice::setVolumeCurveGamma(Float32 newGamma)
+{
+    if (newGamma < kVolumeCurveGammaMin) {
+        newGamma = kVolumeCurveGammaMin;
+    } else if (newGamma > kVolumeCurveGammaMax) {
+        newGamma = kVolumeCurveGammaMax;
+    }
+
+    {
+        CAMutex::Locker locker(&stateMutex);
+        volumeCurveGamma = newGamma;
+        CFNumberSmartRef value = CFNumberCreate(NULL, kCFNumberFloat32Type, &newGamma);
+        gPlugIn_Host->WriteToStorage(gPlugIn_Host, CFSTR("volumeCurveGamma"), value);
+    }
+}
+
 void ProxyAudioDevice::calculateVolumeFactors(Float32 volumeL,
                                               Float32 volumeR,
                                               bool mute,
@@ -5629,7 +5791,7 @@ void ProxyAudioDevice::calculateVolumeFactors(Float32 volumeL,
     } else if (volumeL >= 1.0) {
         volumeFactorL = 1.0;
     } else {
-        volumeFactorL = pow(10, (volumeL * (kVolume_MaxDB - kVolume_MinDB) + kVolume_MinDB) / 10);
+        volumeFactorL = powf(10.0, volumeScalarToDecibels(volumeL) / 10.0);
     }
 
     if (volumeR <= 0.0 || mute) {
@@ -5637,7 +5799,7 @@ void ProxyAudioDevice::calculateVolumeFactors(Float32 volumeL,
     } else if (volumeR >= 1.0) {
         volumeFactorR = 1.0;
     } else {
-        volumeFactorR = pow(10, (volumeR * (kVolume_MaxDB - kVolume_MinDB) + kVolume_MinDB) / 10);
+        volumeFactorR = powf(10.0, volumeScalarToDecibels(volumeR) / 10.0);
     }
 }
 
@@ -5688,6 +5850,8 @@ void ProxyAudioDevice::parseConfigurationString(CFStringRef configString, Config
         action = ConfigType::deviceActiveCondition;
     } else if (CFStringCompare(actionString, CFSTR("outputDeviceHideWhenUnavailable"), 0) == kCFCompareEqualTo) {
         action = ConfigType::deviceHideWhenUnavailable;
+    } else if (CFStringCompare(actionString, CFSTR("volumeCurveGamma"), 0) == kCFCompareEqualTo) {
+        action = ConfigType::volumeCurveGamma;
     } else {
         return;
     }
@@ -5728,6 +5892,10 @@ void ProxyAudioDevice::setConfigurationValue(ConfigType type, CFStringRef value)
             setOutputDeviceHideWhenUnavailable(CFStringGetIntValue(value) != 0);
             break;
 
+        case ConfigType::volumeCurveGamma:
+            setVolumeCurveGamma((Float32)CFStringGetDoubleValue(value));
+            break;
+
         default:
             break;
     }
@@ -5751,6 +5919,9 @@ CFStringRef ProxyAudioDevice::copyConfigurationValue(ConfigType type) {
 
         case ConfigType::deviceHideWhenUnavailable:
             return CFStringCreateWithFormat(NULL, NULL, CFSTR("%u"), outputDeviceHideWhenUnavailable ? 1 : 0);
+
+        case ConfigType::volumeCurveGamma:
+            return CFStringCreateWithFormat(NULL, NULL, CFSTR("%f"), volumeCurveGamma);
 
         default:
             return nullptr;

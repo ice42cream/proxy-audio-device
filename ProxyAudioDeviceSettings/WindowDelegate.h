@@ -2,6 +2,8 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+@class VolumeCurvePreviewView;
+
 @interface WindowDelegate : NSObject
 @property(nonatomic, strong) IBOutlet NSTextField *deviceNameTextField;
 @property(nonatomic, strong) IBOutlet NSComboBox *outputDeviceComboBox;
@@ -10,6 +12,10 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, strong) IBOutlet NSButton *userIsActiveRadioButton;
 @property(nonatomic, strong) IBOutlet NSButton *alwaysRadioButton;
 @property(nonatomic, strong) IBOutlet NSButton *hideWhenUnavailableCheckbox;
+// Volume curve controls are created programmatically (see setupVolumeCurveControls)
+@property(nonatomic, strong) NSSlider *volumeCurveSlider;
+@property(nonatomic, strong) NSTextField *volumeCurveValueLabel;
+@property(nonatomic, strong) VolumeCurvePreviewView *volumeCurvePreview;
 
 - (void)awakeFromNib;
 - (IBAction)deviceNameEntered:(id)sender;
@@ -19,6 +25,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (IBAction)userIsActiveConditionSelected:(id)sender;
 - (IBAction)alwaysConditionSelected:(id)sender;
 - (IBAction)hideWhenUnavailableToggled:(id)sender;
+- (IBAction)volumeCurveChanged:(id)sender;
 
 @end
 

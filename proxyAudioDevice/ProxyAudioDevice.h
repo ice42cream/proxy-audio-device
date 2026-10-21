@@ -33,6 +33,25 @@ enum {
 // unavailable. This preserves the long-standing behavior for existing users.
 #define kOutputDeviceDefaultHideWhenUnavailable false
 
+// Enhanced feature: when the target output device disappears (e.g. it is
+// unplugged), remove the proxy device from the audio device list after a grace
+// period, so the system automatically falls back to another output. The
+// removal is debounced by kTargetRemovalGracePeriodSeconds and is re-checked
+// against the device list right before it executes, so brief link retrains
+// (USB-C displays waking up) do not flap the device list. This is a code-level
+// switch only; there is intentionally no settings UI for it yet.
+#define kRemoveProxyWhenTargetUnavailableDefault true
+#define kTargetRemovalGracePeriodSeconds 10.0
+
+// Enhanced feature: perceptual volume curve. The scalar volume (0 to 1) is
+// converted to dB as  dB = kVolume_MinDB + (kVolume_MaxDB - kVolume_MinDB) *
+// pow(scalar, gamma).  gamma = 1 is linear-in-dB (upstream behavior). gamma
+// < 1 spends more slider travel in the loud region for finer control there;
+// gamma > 1 does the opposite. gamma is user-adjustable from the settings app.
+#define kVolumeCurveGammaDefault 1.0
+#define kVolumeCurveGammaMin 0.5
+#define kVolumeCurveGammaMax 1.5
+
 // Proxy clock servo (see GetZeroTimeStamp / updateProxyClockCorrectionNoLock). The proxy device's
 // clock is synthetic, so rather than letting it free-run at a rate estimated from the target
 // device's rate scalar alone, its rate is steered so that the ring buffer fill level measured in
@@ -58,7 +77,8 @@ class ProxyAudioDevice {
         outputDeviceBufferFrameSize,
         deviceName,
         deviceActiveCondition,
-        deviceHideWhenUnavailable
+        deviceHideWhenUnavailable,
+        volumeCurveGamma
     };
     enum class ActiveCondition { proxiedDeviceActive = 0, userActive = 1, always = 2 };
 
@@ -133,6 +153,23 @@ class ProxyAudioDevice {
     bool retrieveOutputDeviceHideWhenUnavailableFromStorage();
     void setOutputDeviceHideWhenUnavailable(bool newHideWhenUnavailable);
     void notifyHiddenPropertyChanged();
+
+    // Enhanced: dynamic removal / restoration of the proxy device when the
+    // target output device disappears / reappears.
+    void armProxyRemovalIfNeeded();
+    void cancelProxyRemoval();
+    void removeProxyDeviceFromSystem();
+    void restoreProxyDeviceFromSystem();
+    void notifyPluginDeviceListChanged();
+    bool proxyDeviceIsVisible() const { return gBox_Acquired && !proxyDeviceRemoved; }
+
+    // Enhanced: perceptual volume curve helpers. These read volumeCurveGamma
+    // without taking stateMutex; callers that already hold stateMutex must not
+    // call them (a single Float32 read is benignly racy).
+    Float32 volumeScalarToDecibels(Float32 scalar);
+    Float32 volumeDecibelsToScalar(Float32 decibels);
+    Float32 retrieveVolumeCurveGammaFromStorage();
+    void setVolumeCurveGamma(Float32 newGamma);
 
     static ProxyAudioDevice *deviceForDriver(void *inDriver);
 
@@ -545,6 +582,15 @@ class ProxyAudioDevice {
     UInt64 proxyClockPeriodsSinceLog = 0;
     ActiveCondition outputDeviceActiveCondition = ActiveCondition::userActive;
     bool outputDeviceHideWhenUnavailable = kOutputDeviceDefaultHideWhenUnavailable;
+
+    // Enhanced: proxy device auto-removal state (protected by stateMutex).
+    const bool removeProxyWhenTargetUnavailable = kRemoveProxyWhenTargetUnavailableDefault;
+    bool proxyDeviceRemoved = false;
+    bool proxyRemovalTimerArmed = false;
+    UInt64 proxyRemovalGeneration = 0;
+
+    // Enhanced: perceptual volume curve exponent (protected by stateMutex).
+    Float32 volumeCurveGamma = kVolumeCurveGammaDefault;
     
     UInt32 gPlugIn_RefCount = 0;
     AudioServerPlugInHostRef gPlugIn_Host = NULL;
